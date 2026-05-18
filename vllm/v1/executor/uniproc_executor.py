@@ -100,13 +100,22 @@ class UniProcExecutor(Executor):
             return result if single_value else [result]
 
         pool = self.worker_pools[self._step_idx % 2]
+        step_id = self._step_idx
 
         def _run():
+            import time
+            t_submit = time.perf_counter()
             with self.execution_lock:
+                t_acq = time.perf_counter()
                 res = run_method(self.driver_worker, method, args, kwargs)
-                if hasattr(res, "get_output"):
-                    return res.get_output() if single_value else [res.get_output()]
-                return res if single_value else [res]
+                t_dispatch = time.perf_counter()
+
+            if hasattr(res, "get_output"):
+                ret = res.get_output()
+                t_out = time.perf_counter()
+                logger.info(f"[AGENT_METRIC_CONCURRENCY] step={step_id} | method={method} | lock_wait={(t_acq-t_submit)*1000:.3f}ms | run_dispatch={(t_dispatch-t_acq)*1000:.3f}ms | tpu_wait={(t_out-t_dispatch)*1000:.3f}ms | total={(t_out-t_submit)*1000:.3f}ms")
+                return ret if single_value else [ret]
+            return res if single_value else [res]
 
         return pool.submit(_run)
 
