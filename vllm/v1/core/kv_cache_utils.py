@@ -634,19 +634,20 @@ def resolve_kv_cache_block_sizes(
     return scheduler_block_size, hash_block_size
 
 
-def get_request_block_hasher(
-    block_size: int,
-    caching_hash_fn: Callable[[Any], bytes],
-) -> Callable[[Request], list[BlockHash]]:
-    """
-    Returns a function which computes the list of un-computed block hashes
-    of a request."""
+class RequestBlockHasher:
+    def __init__(
+        self,
+        block_size: int,
+        caching_hash_fn: Callable[[Any], bytes],
+    ):
+        self.block_size = block_size
+        self.caching_hash_fn = caching_hash_fn
 
-    def request_block_hasher(request: Request) -> list[BlockHash]:
-        start_token_idx = len(request.block_hashes) * block_size
+    def __call__(self, request: Request) -> list[BlockHash]:
+        start_token_idx = len(request.block_hashes) * self.block_size
         num_tokens = request.num_tokens
 
-        if start_token_idx + block_size > num_tokens:
+        if start_token_idx + self.block_size > num_tokens:
             # Early stop when there no new full blocks created.
             return []
 
@@ -663,7 +664,7 @@ def get_request_block_hasher(
         )
         new_block_hashes: list[BlockHash] = []
         while True:
-            end_token_idx = start_token_idx + block_size
+            end_token_idx = start_token_idx + self.block_size
             if end_token_idx > num_tokens:
                 # We only hash full blocks
                 break
@@ -676,16 +677,24 @@ def get_request_block_hasher(
             # Compute the hash of the current block
             block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
             block_hash = hash_block_tokens(
-                caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys
+                self.caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys
             )
 
             new_block_hashes.append(block_hash)
-            start_token_idx += block_size
+            start_token_idx += self.block_size
             prev_block_hash_value = block_hash
 
         return new_block_hashes
 
-    return request_block_hasher
+
+def get_request_block_hasher(
+    block_size: int,
+    caching_hash_fn: Callable[[Any], bytes],
+) -> Callable[[Request], list[BlockHash]]:
+    """
+    Returns a function which computes the list of un-computed block hashes
+    of a request."""
+    return RequestBlockHasher(block_size, caching_hash_fn)
 
 
 def _check_enough_kv_cache_memory(
