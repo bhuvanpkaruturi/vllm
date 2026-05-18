@@ -68,6 +68,8 @@ class UniProcExecutor(Executor):
         from concurrent.futures import ThreadPoolExecutor
         self.worker_pools = [ThreadPoolExecutor(max_workers=1) for _ in range(2)]
         self._step_idx = 0
+        from threading import Lock as ThreadLock
+        self.execution_lock = ThreadLock()
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -100,10 +102,11 @@ class UniProcExecutor(Executor):
         pool = self.worker_pools[self._step_idx % 2]
 
         def _run():
-            res = run_method(self.driver_worker, method, args, kwargs)
-            if hasattr(res, "get_output"):
-                return res.get_output() if single_value else [res.get_output()]
-            return res if single_value else [res]
+            with self.execution_lock:
+                res = run_method(self.driver_worker, method, args, kwargs)
+                if hasattr(res, "get_output"):
+                    return res.get_output() if single_value else [res.get_output()]
+                return res if single_value else [res]
 
         return pool.submit(_run)
 
