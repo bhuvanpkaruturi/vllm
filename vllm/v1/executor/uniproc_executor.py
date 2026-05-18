@@ -65,6 +65,10 @@ class UniProcExecutor(Executor):
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
 
+        from concurrent.futures import ThreadPoolExecutor
+        self.worker_pools = [ThreadPoolExecutor(max_workers=1) for _ in range(2)]
+        self._step_idx = 0
+
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
         distributed_init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -93,20 +97,20 @@ class UniProcExecutor(Executor):
             result = run_method(self.driver_worker, method, args, kwargs)
             return result if single_value else [result]
 
-        try:
-            result = run_method(self.driver_worker, method, args, kwargs)
-            if isinstance(result, AsyncModelRunnerOutput):
-                return AsyncOutputFuture(result, single_value)
-            future = Future[Any]()
-            future.set_result(result if single_value else [result])
-        except Exception as e:
-            future = Future[Any]()
-            future.set_exception(e)
-        return future
+        pool = self.worker_pools[self._step_idx % 2]
+
+        def _run():
+            res = run_method(self.driver_worker, method, args, kwargs)
+            if hasattr(res, "get_output"):
+                return res.get_output() if single_value else [res.get_output()]
+            return res if single_value else [res]
+
+        return pool.submit(_run)
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        self._step_idx += 1
         output = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
