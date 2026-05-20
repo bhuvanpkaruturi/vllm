@@ -469,14 +469,23 @@ class EngineCore:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
         """
+        import time
+        t_start = time.perf_counter()
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
         engine_core_outputs = None
+        t_pop = 0.0
+        t_update = 0.0
+        popped_tokens = 0
+        scheduled_tokens = 0
+
         # If queue is full (size == batch_queue_size), pop and resolve the oldest batch (Batch N-1) BEFORE launching Batch N!
         # This prevents jax.device_get() from blocking on Batch N's XLA stream!
         if len(batch_queue) >= self.batch_queue_size:
+            t0 = time.perf_counter()
             future, prior_scheduler_output, exec_model_fut = batch_queue.pop()
+            popped_tokens = prior_scheduler_output.total_num_scheduled_tokens
             with (
                 self.log_error_detail(prior_scheduler_output),
                 self.log_iteration_details(prior_scheduler_output),
@@ -485,16 +494,30 @@ class EngineCore:
                 if model_output is None:
                     exec_model_fut.result()
                     raise RuntimeError("unexpected error")
+            t1 = time.perf_counter()
+            t_pop = (t1 - t0) * 1000
 
             self._process_aborts_queue()
+            t2 = time.perf_counter()
             engine_core_outputs = self.scheduler.update_from_output(
                 prior_scheduler_output, model_output
             )
+            t3 = time.perf_counter()
+            t_update = (t3 - t2) * 1000
 
         model_executed = False
         deferred_scheduler_output = None
+        t_sched = 0.0
+        t_submit = 0.0
+
         if self.scheduler.has_requests():
+            t4 = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
+            t5 = time.perf_counter()
+            t_sched = (t5 - t4) * 1000
+            scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+            t6 = time.perf_counter()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -515,9 +538,13 @@ class EngineCore:
                     )
                 else:
                     deferred_scheduler_output = scheduler_output
+            t7 = time.perf_counter()
+            t_submit = (t7 - t6) * 1000
 
             if not deferred_scheduler_output:
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                t_end = time.perf_counter()
+                logger.info(f"[AGENT_TIMELINE_MAIN_THREAD] step_total={(t_end-t_start)*1000:.3f}ms | pop_wait={t_pop:.3f}ms (toks={popped_tokens}) | update_from_output={t_update:.3f}ms | schedule={t_sched:.3f}ms (toks={scheduled_tokens}) | submit={t_submit:.3f}ms")
                 if engine_core_outputs is None:
                     return None, True
 
@@ -527,7 +554,9 @@ class EngineCore:
         # If we didn't pop anything earlier (e.g. queue wasn't full), return None or pop if no more requests
         if engine_core_outputs is None:
             if not self.scheduler.has_requests() and batch_queue:
+                t0 = time.perf_counter()
                 future, prior_scheduler_output, exec_model_fut = batch_queue.pop()
+                popped_tokens = prior_scheduler_output.total_num_scheduled_tokens
                 with (
                     self.log_error_detail(prior_scheduler_output),
                     self.log_iteration_details(prior_scheduler_output),
@@ -537,10 +566,17 @@ class EngineCore:
                         exec_model_fut.result()
                         raise RuntimeError("unexpected error")
 
+                t1 = time.perf_counter()
+                t_pop = (t1 - t0) * 1000
                 self._process_aborts_queue()
+                t2 = time.perf_counter()
                 engine_core_outputs = self.scheduler.update_from_output(
                     prior_scheduler_output, model_output
                 )
+                t3 = time.perf_counter()
+                t_update = (t3 - t2) * 1000
+                t_end = time.perf_counter()
+                logger.info(f"[AGENT_TIMELINE_MAIN_THREAD_DRAIN] step_total={(t_end-t_start)*1000:.3f}ms | pop_wait={t_pop:.3f}ms (toks={popped_tokens}) | update_from_output={t_update:.3f}ms")
             else:
                 return None, True
 
@@ -1164,11 +1200,35 @@ class EngineCoreProc(EngineCore):
 
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
+        import time
+        active_start = None
+        step_count = 0
+        
         while self._handle_shutdown():
             # 1) Poll the input queue until there is work to do.
+            has_work_before = self.has_work()
             self._process_input_queue()
+            
+            if not has_work_before and self.has_work():
+                # Transition from Idle to Active!
+                active_start = time.perf_counter()
+                step_count = 0
+                logger.info("[AGENT_METRIC_WALLTIME] Engine active. Starting generation sequence.")
+            
             # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            if self.has_work():
+                step_count += 1
+                t_step_start = time.perf_counter()
+                self._process_engine_step()
+                t_step_end = time.perf_counter()
+                logger.info(f"[AGENT_METRIC_WALLTIME] step={step_count} | latency={(t_step_end-t_step_start)*1000:.3f}ms")
+            
+            if active_start is not None and not self.has_work():
+                # Transition from Active to Idle!
+                active_end = time.perf_counter()
+                total_walltime = (active_end - active_start) * 1000
+                logger.info(f"[AGENT_METRIC_WALLTIME] Engine idle. Generation sequence completed. Total steps={step_count} | Overall Walltime={total_walltime:.3f}ms")
+                active_start = None
 
         raise SystemExit
 

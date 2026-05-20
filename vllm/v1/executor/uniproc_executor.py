@@ -23,6 +23,25 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+class SeqLock:
+    def __init__(self):
+        from threading import Lock, Condition
+        self._lock = Lock()
+        self._cond = Condition(self._lock)
+        self.next_seq = 1
+
+    def acquire(self, seq: int):
+        self._lock.acquire()
+        while self.next_seq != seq:
+            self._cond.wait()
+
+    def release(self, increment: int = 1):
+        self.next_seq += increment
+        self._cond.notify_all()
+        self._lock.release()
+
+
+
 class AsyncOutputFuture(Future):
     def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):
         self.async_output = async_output
@@ -66,10 +85,19 @@ class UniProcExecutor(Executor):
         current_platform.update_block_size_for_backend(self.vllm_config)
 
         from concurrent.futures import ThreadPoolExecutor
-        self.worker_pools = [ThreadPoolExecutor(max_workers=1) for _ in range(2)]
+        import os
+        self.baseline_mode = os.getenv("VLLM_BASELINE_CONCURRENCY") == "1"
+        
+        if self.baseline_mode:
+            logger.info("Initializing UniProcExecutor in SYNCHRONOUS BASELINE MODE")
+            self.worker_pools = [ThreadPoolExecutor(max_workers=1) for _ in range(1)]
+            from threading import Lock as ThreadLock
+            self.execution_lock = ThreadLock()
+        else:
+            logger.info("Initializing UniProcExecutor in OPTIMIZED PARALLEL OVERLAP MODE")
+            self.worker_pools = [ThreadPoolExecutor(max_workers=1) for _ in range(2)]
+            self.execution_lock = SeqLock()
         self._step_idx = 0
-        from threading import Lock as ThreadLock
-        self.execution_lock = ThreadLock()
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -91,6 +119,7 @@ class UniProcExecutor(Executor):
         kwargs: dict | None = None,
         non_block: bool = False,
         single_value: bool = False,
+        skip_sample: bool = False,
     ) -> Any:
         if kwargs is None:
             kwargs = {}
@@ -99,22 +128,59 @@ class UniProcExecutor(Executor):
             result = run_method(self.driver_worker, method, args, kwargs)
             return result if single_value else [result]
 
+        if self.baseline_mode:
+            pool = self.worker_pools[0]
+            step_id = self._step_idx
+            
+            def _run_baseline():
+                import time
+                t_submit = time.perf_counter()
+                with self.execution_lock:
+                    t_acq = time.perf_counter()
+                    res = run_method(self.driver_worker, method, args, kwargs)
+                    if hasattr(res, "get_output"):
+                        ret = res.get_output()
+                        t_out = time.perf_counter()
+                        logger.info(f"[AGENT_METRIC_CONCURRENCY] step={step_id} | method={method} | lock_wait={(t_acq-t_submit)*1000:.3f}ms | run_dispatch={(t_out-t_acq)*1000:.3f}ms | total={(t_out-t_submit)*1000:.3f}ms")
+                        return ret if single_value else [ret]
+                    t_out = time.perf_counter()
+                    return res if single_value else [res]
+            return pool.submit(_run_baseline)
+
         pool = self.worker_pools[self._step_idx % 2]
         step_id = self._step_idx
+
+        if method == "execute_model":
+            seq = 2 * step_id - 1
+            kwargs = dict(kwargs)
+            kwargs["execution_lock"] = self.execution_lock
+            kwargs["seq"] = seq
+        elif method == "sample_tokens":
+            seq = 2 * step_id
+        else:
+            seq = None
 
         def _run():
             import time
             t_submit = time.perf_counter()
-            with self.execution_lock:
-                t_acq = time.perf_counter()
+            if seq is not None and method != "execute_model":
+                self.execution_lock.acquire(seq)
+            t_acq = time.perf_counter()
+            
+            try:
                 res = run_method(self.driver_worker, method, args, kwargs)
+            finally:
                 t_dispatch = time.perf_counter()
+                if seq is not None:
+                    increment = 2 if skip_sample else 1
+                    self.execution_lock.release(increment=increment)
 
             if hasattr(res, "get_output"):
                 ret = res.get_output()
                 t_out = time.perf_counter()
                 logger.info(f"[AGENT_METRIC_CONCURRENCY] step={step_id} | method={method} | lock_wait={(t_acq-t_submit)*1000:.3f}ms | run_dispatch={(t_dispatch-t_acq)*1000:.3f}ms | tpu_wait={(t_out-t_dispatch)*1000:.3f}ms | total={(t_out-t_submit)*1000:.3f}ms")
                 return ret if single_value else [ret]
+            logger.info(f"[AGENT_METRIC_CONCURRENCY] step={step_id} | method={method} | lock_wait={(t_acq-t_submit)*1000:.3f}ms | run_dispatch={(t_dispatch-t_acq)*1000:.3f}ms | total={(t_dispatch-t_submit)*1000:.3f}ms")
             return res if single_value else [res]
 
         return pool.submit(_run)
@@ -123,11 +189,16 @@ class UniProcExecutor(Executor):
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
         self._step_idx += 1
+        skip_sample = (
+            (self.vllm_config.model_config.runner_type == "pooling")
+            or scheduler_output.total_num_scheduled_tokens == 0
+        )
         output = self.collective_rpc(
             "execute_model",
             args=(scheduler_output,),
             non_block=non_block,
             single_value=True,
+            skip_sample=skip_sample,
         )
         # In non-blocking mode, surface any exception as early as possible.
         if non_block and output.done():
