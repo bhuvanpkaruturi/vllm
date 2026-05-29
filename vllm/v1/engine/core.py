@@ -456,6 +456,8 @@ class EngineCore:
                 break
             t0 = time.perf_counter()
             scheduler_output = self.scheduler.schedule()
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                break
             self.model_executor.prepare_only(scheduler_output)
             t1 = time.perf_counter()
             logger.info(f"[PRE_PREPARE_EXPERIMENT] CPU Prepared Step {i+1}/5 | latency={(t1-t0)*1000:.3f}ms")
