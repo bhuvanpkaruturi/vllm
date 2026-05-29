@@ -446,30 +446,65 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        import time
+        logger.info("[PRE_PREPARE_EXPERIMENT] Starting 5-step Decoupled Preparation Phase...")
+        t_prep_start = time.perf_counter()
+        prepared_outputs = []
+        for i in range(5):
+            if not self.scheduler.has_requests():
+                break
+            t0 = time.perf_counter()
+            scheduler_output = self.scheduler.schedule()
+            self.model_executor.prepare_only(scheduler_output)
+            t1 = time.perf_counter()
+            logger.info(f"[PRE_PREPARE_EXPERIMENT] CPU Prepared Step {i+1}/5 | latency={(t1-t0)*1000:.3f}ms")
+            prepared_outputs.append(scheduler_output)
+        t_prep_end = time.perf_counter()
+        logger.info(f"[PRE_PREPARE_EXPERIMENT] Finished CPU Preparation Phase | total_prep_time={(t_prep_end-t_prep_start)*1000:.3f}ms")
 
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+        logger.info("[PRE_PREPARE_EXPERIMENT] Starting 5-step Asynchronous TPU Execution Phase...")
+        t_exec_start = time.perf_counter()
+        
+        # Dispatch all prepared steps to the TPU asynchronously
+        futures = []
+        for i, scheduler_output in enumerate(prepared_outputs):
+            t0 = time.perf_counter()
+            future = self.model_executor.dispatch_prepared_batch(non_block=True)
+            t1 = time.perf_counter()
+            logger.info(f"[PRE_PREPARE_EXPERIMENT] TPU Dispatched Step {i+1}/5 | latency={(t1-t0)*1000:.3f}ms")
+            futures.append((scheduler_output, future))
+
+        final_outputs = {}
+        # Synchronize, sample, and update state sequentially
+        for i, (scheduler_output, future) in enumerate(futures):
+            t0 = time.perf_counter()
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.log_error_detail(scheduler_output),
+                self.log_iteration_details(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+
+            self._process_aborts_queue()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            if engine_core_outputs:
+                final_outputs.update(engine_core_outputs)
+            t1 = time.perf_counter()
+            logger.info(f"[PRE_PREPARE_EXPERIMENT] Sync & Completed Step {i+1}/5 | latency={(t1-t0)*1000:.3f}ms")
+
+            # Post-step hook
+            self.post_step(scheduler_output.total_num_scheduled_tokens > 0)
+        t_exec_end = time.perf_counter()
+        logger.info(f"[PRE_PREPARE_EXPERIMENT] Finished TPU Execution Phase | total_exec_time={(t_exec_end-t_exec_start)*1000:.3f}ms")
+
+        return final_outputs, True
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,

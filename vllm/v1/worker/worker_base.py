@@ -343,7 +343,11 @@ class WorkerWrapperBase:
         self._apply_mm_cache(scheduler_output)
 
         return self.worker.execute_model(scheduler_output)
+    def prepare_only(self, scheduler_output: SchedulerOutput) -> None:
+        self.worker.prepare_only(scheduler_output)
 
+    def dispatch_prepared_batch(self) -> ModelRunnerOutput | None:
+        return self.worker.dispatch_prepared_batch()
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
         if mm_receiver_cache is not None:

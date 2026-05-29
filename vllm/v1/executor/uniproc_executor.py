@@ -102,7 +102,21 @@ class UniProcExecutor(Executor):
             future = Future[Any]()
             future.set_exception(e)
         return future
+    def prepare_only(self, scheduler_output: SchedulerOutput) -> None:
+        self.collective_rpc(
+            "prepare_only",
+            args=(scheduler_output,),
+            single_value=True,
+        )
 
+    def dispatch_prepared_batch(
+        self, non_block: bool = True
+    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        return self.collective_rpc(
+            "dispatch_prepared_batch",
+            non_block=non_block,
+            single_value=True,
+        )
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
