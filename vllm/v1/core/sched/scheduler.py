@@ -1314,6 +1314,7 @@ class Scheduler(SchedulerInterface):
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+        logger.info(f"[DEBUG_UPDATE_INPUT] num_scheduled={len(num_scheduled_tokens)} | num_sampled={len(sampled_token_ids) if sampled_token_ids else 0} | first_sampled={sampled_token_ids[0] if sampled_token_ids else 'N/A'}")
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
@@ -1433,6 +1434,7 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                logger.info(f"[DEBUG_STOP] req_id={req_id} | new_token_ids={new_token_ids} | stopped={stopped} | status={request.status} | output_len={len(request.output_token_ids)} | max_tokens={request.sampling_params.max_tokens if request.sampling_params else 'N/A'}")
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

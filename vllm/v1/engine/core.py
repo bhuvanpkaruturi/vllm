@@ -489,6 +489,8 @@ class EngineCore:
                 model_output = future.result()
                 if model_output is None:
                     model_output = self.model_executor.sample_tokens(grammar_output)
+                if hasattr(model_output, "get_output"):
+                    model_output = model_output.get_output()
 
             self._process_aborts_queue()
             engine_core_outputs = self.scheduler.update_from_output(
@@ -504,7 +506,7 @@ class EngineCore:
         t_exec_end = time.perf_counter()
         logger.info(f"[PRE_PREPARE_EXPERIMENT] Finished TPU Execution Phase | total_exec_time={(t_exec_end-t_exec_start)*1000:.3f}ms")
 
-        return final_outputs, True
+        return final_outputs, len(prepared_outputs) > 0
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
